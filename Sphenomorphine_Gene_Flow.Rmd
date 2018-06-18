@@ -1,0 +1,1284 @@
+---
+title: "Sphenomorphine Gene Flow"
+author: "Sonal Singhal"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(ape)
+library(BAMMtools)
+library(classInt)
+library(corrplot)
+library(cowplot)
+library(ggtree)
+library(gridExtra)
+library(jpeg)
+library(knitr)
+library(maptools)
+library(nlme)
+library(phangorn)
+library(phytools)
+library(phylolm)
+library(RColorBrewer)
+library(scales)
+library(viridis)
+data(wrld_simpl)
+```
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
+
+source("~/scripts/phyutility.R")
+source("~/scripts/gene_flow/jetz_div_rates.R")
+
+plot_png = function(path, add=FALSE)
+{
+  require('png')
+  pngImage = readPNG(path, native=T) # read the file
+  res = dim(pngImage)[1:2] # get the resolution
+  if (!add) # initialize an empty plot area if add==FALSE
+    plot(1,1,xlim=c(1,res[1]),ylim=c(1,res[2]),asp=1,type='n',xaxs='i',yaxs='i',xaxt='n',yaxt='n',xlab='',ylab='',bty='n')
+  
+  rasterImage(pngImage,1,1,res[1],res[2])
+}
+```
+
+## Project Goals
+1. To characterize how genetic differentiation accumulates within species across a diverse clade of lizards
+2. To determine which organismal and environmental variables (if any) predict variation in the rate at which differentiation accumulate across species
+3. To test if the rate at which genetic differentiation accumulates is correlated with variation in speciation rate.
+
+## Overview of project
+
+Before we get started, let's load the data that summarizes all species.
+```{r data}
+d = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/metadata/sphenomorphine_species.csv", stringsAsFactors=F)
+figdir = '~/Dropbox/Sphenomorphine_Gene_Flow/manuscript_drafts/figures2/'
+```
+
+Here's a phylogeny of the sphenomorphines (outgroups not shown). This includes OTUs only.
+```{r phylo, echo=FALSE}
+t1 = read.tree("~/Dropbox/Sphenomorphine_Gene_Flow/data/phylogeny/beast_ucln_31July17/otu.tre")
+par(mar=c(0, 0, 0, 0))
+plot(ladderize(t1), type="fan", show.tip.label=F)
+```
+
+Here's a view of the tree with uncertainty shown.
+```{r, echo=F}
+pdf(paste(figdir, "S1_full_tree.pdf", sep=""), height=15, width=6)
+par(mar=c(0, 1, 0, 1), xpd=NA)
+
+tree = '~/Dropbox/Sphenomorphine_Gene_Flow/data/phylogeny/beast_ucln_31July17/mtcds_pos1.sub.tre'
+tree1 = read.nexus(tree)
+tree2 = read.beast(tree)
+tree2 = fortify(tree2)
+
+tips1 = d[match(tree1$tip.label, d$sanger_sample), "OTU"]
+tips2 = d[match(tree1$tip.label, d$sanger_sample), "SPECIES"]
+d2 = data.frame(sample=tree1$tip.label, tips1, tips2, stringsAsFactors = F)
+dup = names(table(tips1)[table(tips1) > 1])
+d2$name = d2$tips1
+d2[d2$tips1 %in% dup, "name"] = d2[d2$tips1 %in% dup, "tips2"]
+tips2 = tree1$tip.label[tree1$edge[, 2][tree1$edge[, 2] <= Ntip(tree1)]]
+tips = d2[match(tips2, d2$sample), "name"]
+
+minH = gsub(",\\S+", "", tree2$height_0.95_HPD)
+minH = gsub("\\[", "", minH)
+minH = as.numeric(minH)
+  
+maxH = gsub("^\\[\\S+,", "", tree2$height_0.95_HPD)
+maxH = gsub("\\]", "", maxH)
+maxH = as.numeric(maxH)
+  
+bt = c(rep(0, Ntip(tree1)), branching.times(tree1))
+names(bt) = seq(1, length(bt))
+minH = minH - bt
+maxH = abs(maxH - bt)
+  
+tree1$node.label = tree2$posterior
+
+lertips = tips2[grep("Lerista", tips)]
+cttips = tips2[grep("Ctenotus", tips)]
+otips = tips2
+otips = otips[grep("Ctenotus", tips, invert=T)]
+otips = otips[grep("Lerista", tips, invert=T)]
+outs = d[d$outgroup == TRUE, "sanger_sample"]
+otips = otips[!otips %in% outs[complete.cases(outs)]]
+
+clcolr <- rep("darkgrey", dim(tree1$edge)[1]) 
+clcolr[which.edge(tree1, lertips)] <- "#1f78b4"
+clcolr[which.edge(tree1, cttips)] <- "#a6cee3"
+clcolr[which.edge(tree1, otips)] <- "#b2df8a" 
+
+tipsx = d2[match(tree1$tip.label, d2$sample), "name"]
+tree1$tip.label = tipsx
+plot(tree1, cex=0.4, edge.color=clcolr)
+lastPP <- get("last_plot.phylo", envir = .PlotPhyloEnv)
+xlen = max(lastPP$xx) - min(lastPP$xx)
+  
+for (i in (Ntip(tree1) + 1):length(bt)) {
+  ypos = lastPP$yy[i]
+  xmin = lastPP$xx[i] + minH[i]
+  xmax = lastPP$xx[i] + maxH[i]
+    
+  lines(c(xmin, xmax), c(ypos, ypos), col=alpha("black", 0.3), lwd=2)
+  label = tree1$node.label[i]
+  if (as.numeric(label) > 0.95) {
+    nodelabels(text="", frame="none", node=i, pch=16, col="black", cex=0.6)
+    }
+  }
+
+dev.off()
+```
+
+There are `r length(unique(d$OTU))` putative OTUs in sphenomorphines; this tree samples `r length(t1$tip.label)` of them. 
+
+```{r, echo=F}
+t2 = t1
+
+res = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/divergence/divergence.all_OTUs.csv", stringsAsFactors=F)
+res1 = res[res$distance_type == 'geo_dist' & res$genetic_type == 'fst', ]
+
+# otus sampled for gene flow
+otus = unique(res1$OTU)
+
+# for depicting at least, add tip to tree next to a species in complex
+# long term, figure out a way to get these OTUs in tree
+not_in_tree = otus[!complete.cases(match(otus, t2$tip.label))]
+for (i in 1:length(not_in_tree)) {
+  sister = grep(gsub("_\\d", "", not_in_tree[i]), t2$tip.label)
+  sister = t2$tip.label[sister]
+  if (length(sister) > 0) {
+    sister = sister[1]
+    t2 <- bind.tip(t2, not_in_tree[i], where=which(t2$tip.label== sister),
+    position = 0.5 * t2$edge.length[which(t2$edge[,2]==
+    which(t2$tip.label==sister))])
+  }
+}
+t3 = drop.tip(t2, setdiff(t2$tip.label, otus))
+```
+
+
+```{r, echo=F}
+willeerd.tiplabels <- function (text, tip, adj = c(0.5, 0.5), radial.adj=1, frame = "rect", pch = NULL, thermo = NULL, pie = NULL, piecol = NULL, col = "black", bg = "yellow", horiz = FALSE, width = NULL, height = NULL, ...) 
+{
+    lastPP <- get("last_plot.phylo", envir = .PlotPhyloEnv)
+    if (missing(tip)) 
+        tip <- 1:lastPP$Ntip
+    lastPP$xx <- lastPP$xx * radial.adj
+    lastPP$yy <- lastPP$yy * radial.adj
+    XX <- lastPP$xx[tip]
+    YY <- lastPP$yy[tip]
+    BOTHlabels(text, tip, XX, YY, adj, frame, pch, thermo, pie, 
+        piecol, col, bg, horiz, width, height, ...)
+}
+
+t2 = read.tree(text=write.tree(ladderize(t2)))
+toes = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/morphology/species_OTU_means.csv", stringsAsFactors = F)
+toes$digits = toes$hand_digits + toes$toe_digits
+toes = toes[match(t2$tip.label, toes$OTU), "digits"]
+
+lertips = t2$tip.label[grep("Lerista", t2$tip.label)]
+cttips = t2$tip.label[grep("Ctenotus", t2$tip.label)]
+otips = d[d$outgroup == FALSE, "OTU"]
+otips = otips[grep("Ctenotus", otips, invert=T)]
+otips = otips[grep("Lerista", otips, invert=T)]
+
+clcolr <- rep("darkgrey", dim(t2$edge)[1]) 
+clcolr[which.edge(t2, lertips)] <- "#1f78b4"
+clcolr[which.edge(t2, cttips)] <- "#a6cee3"
+clcolr[which.edge(t2, otips)] <- "#b2df8a"
+
+lwds = rep(1, nrow(t2$edge))
+lwds[which(t2$edge[,2] %in% match(otus, t2$tip.label))] = 3
+
+tips = t2$tip.label
+ctn = findMRCA(t2, tips[grep("Ct", tips)])
+len = findMRCA(t2, tips[grep("Lerista", tips)])
+```
+
+```{r, echo=F}
+pdf(paste(figdir, "1_phylogeny.pdf", sep=""))
+layout(matrix(c(1, 1, 1, 1,
+                 2, 3, 4, 5), nrow=2, byrow=TRUE), heights=c(2,1))
+par(mar=c(0, 0, 0, 0))
+plot(t2, edge.color=clcolr, type="fan", show.tip.label=F, edge.width=lwds)
+willeerd.tiplabels("", seq(1, Ntip(t1)), pch=16, cex=toes * 0.08, frame="none", col="darkgrey", radial.adj = 1.03)
+
+nodelabels("", ctn, pch=16, col="gray55", frame="none", cex=2.5)
+nodelabels("", len, pch=16, col="gray55", frame="none", cex=2.5)
+nodelabels("C", ctn, pch="", col="black", frame="none", cex=1)
+nodelabels("L", len, pch="", col="black", frame="none", cex=1)
+
+text("digits", x=-31, y=-20)
+vals = c(2, 5, 10)
+for (i in 1:length(vals)) {
+  points(x=-29, y=-28 + 2* i, pch=16, cex=vals[i] * 0.08, col="darkgrey")
+  text(vals[i], x=-31, y=-28 + 2* i)
+}
+
+par(mar=c(0, 0, 1, 0))
+plot_png("~/Dropbox/Sphenomorphine_Gene_Flow/maggie_drawings/Ctenotus_strauchii.png")
+title("C. strauchii", font.main=3)
+plot_png("~/Dropbox/Sphenomorphine_Gene_Flow/maggie_drawings/Ctenotus_robustus.png")
+title("C. robustus", font.main=3)
+plot_png("~/Dropbox/Sphenomorphine_Gene_Flow/maggie_drawings/Lerista_dorsalis.png")
+title("L. dorsalis", font.main=3)
+plot_png("~/Dropbox/Sphenomorphine_Gene_Flow/maggie_drawings/Lerista_praepedita.png")
+title("L. praepedita", font.main=3)
+dev.off()
+```
+
+Of these OTUs, we sampled `r length(otus)` for gene flow. 
+
+Note that we need to get data for `r paste(not_in_tree, collapse="; ")`. Right now, these tips have been pasted into their species complex at the halfway point of the terminal branch length.
+
+```{r, echo=F, fig.height = 7, fig.width = 6, fig.align = "center"}
+# get lat longs for all individuals
+ll1 = read.csv("/Users/sonal/macroevolution/eco_IBD_oz/data/metadata/individual_data_nomissing22Oct15.csv", stringsAsFactors=F, na.string=c("", "NA"))
+ll2 = read.csv("/Users/sonal/Dropbox/Sphenomorphine_Gene_Flow/data/metadata/spheno_ind_data.csv", stringsAsFactors=F, na.string=c("", "NA"))
+
+# some overlap, and ll2 is more complete
+ll1 = ll1[!(ll1$sample_id %in% ll2$SAMPLE_ID), ]
+ll1 = ll1[, c("sample_id", "lon", "lat")]
+ll2 = ll2[, c("SAMPLE_ID", "LON", "LAT")]
+
+names(ll2) = names(ll1)
+ll = rbind(ll1, ll2)
+ll = ll[complete.cases(ll$lon), ]
+
+aus <- wrld_simpl[which(wrld_simpl@data$NAME == 'Australia'),]
+plot(NULL, xlim=c(112, 155), ylim=c(-44, -9), xlab="", ylab="", axes=F)
+plot(aus, add=T, col=alpha("gray", 0.5), border=NA)
+points(ll$lon, ll$lat, bg="#1b9e77", pch=21)
+```
+
+Across these OTUs, we sampled `r nrow(ll)` individuals for ddRAD data.
+
+## Patterns of Genetic Differentiation within Species
+### Basic Approach
+The basic approach we used:
+
+  - to sample broadly across an OTU -- on average we sampled 8.5 individuals per OTU
+  - to calculate Fst between all pairwise individual comparisons
+  - to use these estimates to infer the rate at which genetic differentiation accumulates
+  - this slope was the key "summary statistic" used in all analyses
+
+```{r, echo = F}
+# returns the inverse of Fst
+inv_fst = function(x) {
+  if (x == 1) {
+    return(NA)
+  } else {
+    return(x / (1 - x))
+  }
+}
+
+# returns log distance
+# note that this drops all comparisons
+# between points at the same place
+log_dist = function(x) {
+  if (x == 0) {
+    return(NA)
+  } else {
+    return(log(x))
+  }
+}
+
+div = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/divergence/species/Ctenotus_robustus_3.divergence_cov10.csv", stringsAsFactors = F)
+div$log_dist = sapply(div$geo_dist, log_dist)
+div$inv_fst = sapply(div$fst, inv_fst)
+robu_shp = "~/Dropbox/Sphenomorphine_Gene_Flow/data/geographic_ranges/OTU_ranges/Ctenotus_robustus_3.shp"
+inds = unique(c(div$ind1, div$ind2))
+robu_ll = ll[ll$sample_id %in% inds, ]
+
+pdf(paste(figdir, "2_approach.pdf", sep=""), width=7, height=2.5)
+par(mfrow=c(1, 3), mar=c(1,1,3,1))
+aus <- wrld_simpl[which(wrld_simpl@data$NAME == 'Australia'),]
+par(mar=c(1,1,1,1))
+plot(NULL, xlim=c(112, 155), ylim=c(-44, -9), xlab="", ylab="", axes=F)
+plot(aus, add=T, col=alpha("gray", 0.5), border=NA)
+range = readShapePoly(robu_shp)
+par(mar=c(1,1,3,1))
+plot(range, add=T, col="#1f78b4", border=NA)
+robu_ll= robu_ll[robu_ll$lon > 136,]
+points(robu_ll$lon, robu_ll$lat, pch=21, bg="white")
+path="~/Dropbox/Sphenomorphine_Gene_Flow/maggie_drawings/Ctenotus_robustus.png"
+pngImage = readPNG(path, native=T) 
+rasterImage(pngImage, 110, -48, 138, -29)
+title("sample individuals broadly\nacross range", font.main=1)
+
+par(mar=c(4, 4, 3, 2))
+xvals1 = pretty(div$log_dist, 3)
+yvals1 = pretty(div$inv_fst, 3)
+plot(NULL, axes=FALSE, xlim=range(xvals1), 
+     ylim=range(yvals1), xaxs="i", yaxs="i", xlab="", ylab="")
+points(div$log_dist, div$inv_fst, pch=21, bg="#1f78b4") 
+# xaxis
+axis(1, at=xvals1, labels=FALSE, tck=-0.015)
+mtext(xvals1, side=1, line=0.5, at=xvals1, cex=0.75)
+mtext("log(geographic distance, m)", side=1, line=2.4, cex=0.75)
+# y axis
+axis(2, at=yvals1, labels=FALSE, tck=-0.015, las=1)
+mtext(yvals1, side=2, line=0.5, at=yvals1, las=1, cex=0.75)
+mtext(expression("F"["ST"] ~ "/ (1-F"["ST"] ~ ")"), side=2, line=2.4, cex=0.75)
+# title
+title(expression("infer" ~ F[ST] ~ "between all individuals"), font.main=1)
+
+m = lm(div$inv_fst ~ div$log_dist)
+plot(NULL, axes=FALSE, xlim=range(xvals1), 
+     ylim=range(yvals1), xaxs="i", yaxs="i", xlab="", ylab="")
+points(div$log_dist, div$inv_fst, pch=21, bg=alpha("#1f78b4", 0.5), col=alpha("black", 0.5)) 
+abline(m, col="#1f78b4", lwd=3)
+# xaxis
+axis(1, at=xvals1, labels=FALSE, tck=-0.015)
+mtext(xvals1, side=1, line=0.5, at=xvals1, cex=0.75)
+mtext("log(geographic distance, m)", side=1, line=2.4, cex=0.75)
+# y axis
+axis(2, at=yvals1, labels=FALSE, tck=-0.015, las=1)
+mtext(yvals1, side=2, line=0.5, at=yvals1, las=1, cex=0.75)
+mtext(expression("F"["ST"] ~ "/ (1-F"["ST"] ~ ")"), side=2, line=2.4, cex=0.75)
+# title
+title(expression(calculate ~ beta[IBD]), font.main=1)
+dev.off()
+```
+
+
+### Species by species results
+We have included detailed summary reports for each OTU in `Dropbox/Sphenomorphine_Gene_Flow/figures/maps.pdf`. Note that I have trouble opening it in Preview so you might try Adobe
+
+Each page shows:
+
+  - a map with the geographic range of the OTU + the individual sampling points
+  - the Fst estimates shown with respect to geographic distance and the inferred slope
+  
+    - note Fst is inverse
+    - geographic distance is taken as log
+    - this is as discussed in Rousset 1997
+  - also shown is a histogram showing variation in slope estimates because of estimation error in Fst
+    - to generate this, did 100 bootstraps, across the variance in Fst estimates between any two individuals
+  - also shown for OTUs where we sampled 6 or more individuals is how jackknifing individuals influences Fst estimates
+  
+Take homes:
+
+  - not that much error is introduced to slope estimates because of inaccurate estimation of Fst (I think this is because we typically are inferring Fst across many sites)
+  - a decent amount of error is introduced because of sampling across range
+    - it seems that the fewer individuals sampled, the higher the inferred slope
+    - should control for that by including number of individuals sampled as a factor in any model fitting
+
+### Differences in approaches used to estimate genetic difference
+We estimated genetic differentiation between individuals using:
+  
+  - mtDNA dxy
+  - nDNA dxy
+  - Fst
+
+Note that there is no strong theoretical framework for using mtDNA dxy and nDNA dxy to look at differentiation across the landscape, so we focus on Fst here. However, if we compare pairwise estimates across all individuals, these different approaches to measuring differentiation are all pretty correlated.
+
+But particularly in dxy mtDNA & dxy nDNA see some differences that are likely because of cytonuclear introgression.
+```{r, echo=F, fig.height = 4, fig.width = 10, fig.align = "center"}
+
+keep = c('cl', 'ind1', 'ind2', 'geo_dist', 'nuc_dxy', 'nuc_denom', 'dxy_mean', 'dxy_sd', 'fst', 'fst_mean', 'fst_sd', 'fst_denom', 'mt_dxy', 'mt_denom')
+
+divfiles = list.files("~/Dropbox/Sphenomorphine_Gene_Flow/data/divergence/species/", full.names = T)
+div = do.call(rbind, lapply(divfiles, function(x) {read.csv(x, stringsAsFactors = F)[, keep] }))
+# get rid of poor quality data
+div = div[div$nuc_denom >= 10000,]
+div = div[div$fst_denom >= 1000,]
+
+# remove fst outliers
+div = div[div$fst > -0.5,]
+
+cor1 = cor.test(div$fst, div$nuc_dxy)
+cor2 = cor.test(div$fst, div$mt_dxy)
+cor3 = cor.test(div$mt_dxy, div$nuc_dxy)
+
+label1 <- substitute(paste(rho, " = ", estimate, ", P = ", pvalue, sep=""),
+                    list(estimate = signif(cor1$estimate, 2), pvalue = signif(cor1$p.value, 1)))
+label2 <- substitute(paste(rho, " = ", estimate, ", P = ", pvalue, sep=""),
+                     list(estimate = signif(cor2$estimate, 2), pvalue = signif(cor2$p.value, 1)))
+label3 <- substitute(paste(rho, " = ", estimate, ", P = ", pvalue, sep=""),
+                     list(estimate = signif(cor3$estimate, 2), pvalue = signif(cor3$p.value, 1)))
+
+a = ggplot(div, aes(fst, nuc_dxy)) + geom_point(alpha=0.1) + labs(x = expression("F"[ST]), y=expression("nDNA d"[xy]), title=label1)
+b = ggplot(div, aes(fst, mt_dxy)) + geom_point(alpha=0.1) + labs(x = expression("F"[ST]), y=expression("mtDNA d"[xy]), title=label2)
+c = ggplot(div, aes(mt_dxy, nuc_dxy)) + geom_point(alpha=0.1) + labs(y = expression("nDNA d"[xy]), x=expression("mtDNA d"[xy]), title=label3)
+
+abc = plot_grid(a, b, c, labels = c("A", "B", "C"), align="vh", hjust=-1, ncol=3)
+save_plot(paste(figdir, "S2_raw_dist_correlations.pdf", sep=""), abc, ncol = 3, nrow = 1, base_aspect_ratio = 1.4, base_height=3)
+```
+
+### Environmental vs. geographic distance
+While not a key question in this work, much of the genetic differentiation literature these days is centered around IBD (isolation-by-distance) vs. IBE (isolation-by-environment). To help put our work in context of this, we looked at how much of the variation in pairwise-Fst approaches is explained by geographic vs. environmental distance.
+
+```{r, echo=F}
+diff = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/divergence/divergence.all_OTUs.csv", stringsAsFactors = F)
+diff = diff[diff$distance_type == 'geo_dist' & diff$genetic_type == 'fst', ]
+
+rownames(diff) = diff$OTU
+t4 = drop.tip(t3, setdiff(t3$tip.label, rownames(diff)))
+t4 = ladderize(t4)
+tip.order = t4$tip.label[t4$edge[,2][t4$edge[,2] <= length(t4$tip.label)]]
+diff = diff[tip.order,]
+
+pdf(paste(figdir, "S4_amount_explained.pdf", sep=""), width=3, height=3)
+par(mar=c(0, 0, 0, 0))
+layout(matrix(c(1,2),1,2),c(0.5,0.5))
+par(mar=c(4.1,1.1,1.1,0))
+
+plot.phylo(t4, show.tip.label=F, cex=0.6)
+
+par(mar=c(4.1,0,1.1,1.1))
+cols = rep("gray25", nrow(diff))
+cols[diff$pval > 0.05] = "gray75"
+barplot(diff$r2, horiz=T, names="", space=0, col=cols, width=1, ylim=c(1, nrow(diff))-0.5, xaxt="n", border=F, xlim=c(0,1))
+ticks = c(0, 0.5, 1.0)
+axis(1, ticks, tck=-0.02, labels=NA)
+axis(1, ticks, labels=ticks, lwd = 0, line = -0.6, las = 1)
+mtext("amount explained", side=1, line=1.5)
+dev.off()
+```
+
+
+This plot only shows significant results, and uses Wang (2012)'s approach to multiple-matrix regression.
+
+Gray bars are environment, black bars show geographic distance -- total length of line reflects how much of Fst variation is explained by the two measures. In general, we can explain about half of the pattern of genetic differentiation across OTUs.
+```{r, echo=F}
+mr = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/divergence/divergence.all_OTUs.MMRR.csv", stringsAsFactors=F)
+mr = mr[mr$genetic_type == 'fst',]
+# get rid of missing data
+mr = mr[complete.cases(mr$fit), ]
+# only plot significant
+# mr = mr[which(mr$fit_pval <= 0.05), ]
+
+mr$geo_len = mr$fit * (abs(mr$geo_coeff) / (abs(mr$geo_coeff) + abs(mr$env_coeff)))
+mr$env_len = mr$fit * (abs(mr$env_coeff) / (abs(mr$geo_coeff) + abs(mr$env_coeff)))
+
+rownames(mr) = mr$OTU
+tmr = drop.tip(t3, setdiff(t3$tip.label, rownames(mr)))
+mr = mr[tmr$tip.label,]
+
+par(mar=c(0, 0, 0, 0))
+layout(matrix(c(1,2),1,2),c(0.5,0.5))
+par(mar=c(4.1,1.1,1.1,0))
+
+plot.phylo(tmr, cex=0.6)
+
+par(mar=c(4.1,0,1.1,1.1))
+barplot((mr$geo_len+mr$env_len), horiz=T, names="", space=0, col=NULL, width=1, ylim=c(1, nrow(mr))-0.5, xaxt="n", border=F, xlim=c(0,1))
+barplot(mr$geo_len, add=T, col="black", horiz=T, border=F, names="", space=0, width=1, ylim=c(1, nrow(mr))-0.5, xaxt="n")
+ticks = c(0, 0.25, 0.5, 0.75, 1.0)
+axis(1, ticks, tck=-0.03, labels=NA)
+axis(1, ticks, labels=ticks, lwd = 0, line = -.3, las = 1)
+mtext("correlation", side=1, line=1.5)
+```
+
+## Patterns of Genetic Differentiation among Species
+
+### Variation in IBD slopes
+There is a decent amount of variation in slopes inferred across OTUs. This shows all slopes, including the few which were non-significant. Note that it is also not very normally distributed, so all subsequent analyses will use log(slope).
+```{r, echo=F}
+diff = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/divergence/divergence.all_OTUs.csv", stringsAsFactors = F)
+diff = diff[diff$distance_type == 'geo_dist' & diff$genetic_type == 'fst', ]
+ggplot(diff, aes(slope)) + geom_histogram() + labs(x="differentiation slope", y="frequency")
+```
+
+### Phylogenetic Signal in IBD slopes
+Another way to look at this is how these slopes change across genera. Here, showing the same results as above but for only genera in which we calculated slopes for 3 or more OTUs.
+```{r, echo=F}
+counts = table(diff$genus)
+diff2 = diff[diff$genus %in% names(counts[counts >= 3]), ]
+ggplot(diff2, aes(genus, slope)) + geom_boxplot()
+```
+
+```{r, echo=F}
+color.bar <- function(lut, min, max=-min, ticks, ticknames, title) {
+  scale = (length(lut)-1)/(max-min)
+  
+  nticks = length(ticks)
+  plot(c(0,1), c(min,max), type='n', bty='n', xaxt='n', xlab='', yaxt='n', ylab=title, main="")
+  axis(2, at=ticks, labels=ticknames, las=1)
+  for (i in 1:(length(lut)-1)) {
+    y = (i-1)/scale + min
+    rect(0, y, 1, y+1/scale, col=lut[i], border=NA)
+  }
+}
+
+slopes = diff$slope
+names(slopes) = diff$OTU
+
+slopeslog = log(slopes)
+jenks = classIntervals(slopeslog, 64, style="jenks")
+
+colors = viridis(64)
+x_cols = colors[findCols(jenks)]
+names(x_cols) = names(slopes)
+edgecols = rep("gray", nrow(t3$edge))
+edge.tip.labels = t3$tip.label[t3$edge[,2]]
+
+figs <- matrix(c(0, 0.8, 0, 1, 0.90, 0.95, 0.33, 0.66), byrow = TRUE, nrow = 2, ncol = 4)
+
+cols = x_cols[match(edge.tip.labels, names(x_cols))]
+cols[is.na(cols)] = "lightgray"
+widths = rep(2, length(cols))
+widths[which(cols == "lightgray")] = 0.5
+par(fig = figs[1, ], new = F, mar = c(0, 0, 0, 0))
+plot(t3, type="fan", edge.color=cols, edge.width=widths, show.tip.label=F)
+
+legdf = data.frame(jenks$brks[2:length(jenks$brks)], colors)
+rownames(legdf) = NULL
+names(legdf) = c("log_value", "color")
+legdf$value = exp(legdf$log_value)
+
+par(fig = figs[2, ], new = T, mar=c(0, 0, 0, 0))
+ticknames = c(0.04, 0.1, 1, 4)
+ticks = log(ticknames)
+color.bar(as.character(legdf$color), min=min(legdf$log_value), max=max(legdf$log_value), ticks, ticknames, title="diff. rate")
+lambda_slope = phylosig(t3, slopes[t3$tip.label], test=T, method="lambda")
+```
+Indeed, the pattern of differentiation does show phylogenetic signal: lambda is `r lambda_slope$lambda` and the pvalue for this is `r lambda_slope$P`.
+
+### What explains this variation in IBD slopes?
+What explains why there is variation in IBD slopes?
+
+Genetic differentiation (as measured here) is a function of effective population size (Ne) and migration (*m*). Further, arguments centered around IBD suggest that the more environmental heterogeneity across a range, the less differentiation we would expect. So, based on this, we include the following factors:
+
+  - range size: a proxy for effective population size
+  - SVL: a proxy for effective population size
+  - mean pi, or within-population pi: a more direct measure of effective population size
+  - shank length: these lizards have differing levels of limb loss, which (naively) we might expect would reflect with dispersal patterns -- shank length reflects this
+    - note that I've also explored toe length as a proxy for this; these are both very correlated with each other
+  - elevational range: a proxy for environmental heterogeneity
+  - PC1 range in climate space: a proxy for environmental heterogeneity
+  - ninds: number of individuals used to infer IBD (a nuisance variable)
+  - lat. midpoint: another nuisance variable
+
+First, we looked at correlation among these factors in our model. Including factors with too much colinearity can make model fitting do weird things.
+```{r, echo=F}
+# get mean pi data
+pifiles = list.files("~/Dropbox/Sphenomorphine_Gene_Flow/data/diversity/", full.names = T)
+pi = do.call(rbind, lapply(pifiles, read.csv, stringsAsFactors=F))
+pi = pi[pi$type == 'IND',]
+pi = pi[pi$pi_denom > 50000,]
+pi = aggregate(pi$pi, by=list(pi$lineage), mean, na.rm=T)
+names(pi) = c("cluster", "mean_pi")
+diff$mean_pi = pi[match(diff$cluster, pi$cluster), "mean_pi"]
+
+# get morphology data
+m = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/morphology/species_OTU_means_PCAs.csv", stringsAsFactors=F)
+diff = cbind(diff, m[match(diff$OTU, m$OTU), 3:ncol(m)])
+
+# get range data
+r = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/envirospatial/range_data.csv", stringsAsFactors=F)
+diff = cbind(diff, r[match(diff$OTU, r$OTU), 2:ncol(r)])
+
+dv = "slope"
+iv = c("ninds", "mean_pi", "svl", "PC1", "PC2", "range_size", "lat_midpoint", "PC1_range", "PC2_range")
+
+corrplot.mixed(cor(diff[, iv], use="complete"), upper='ellipse', lower="number", tl.col="black", tl.cex=0.5, tl.srt=45)
+```
+
+
+Then, we test if these factors show phylogenetic signal. Note that within population pi (mean_pi) didn't show phylogenetic signal when measured just across Ctenotus. All our factors (but for ninds) show strong patterns of phylogenetic signal.
+```{r, echo=F, results="asis"}
+cols = c("factor", "lambda", "pvalue")
+lambdas = data.frame(matrix(NA, nrow=length(iv), ncol=length(cols)))
+names(lambdas) = cols
+for (i in 1:length(iv)) {
+  test = phylosig(t3, diff[match(t3$tip.label, diff$OTU), iv[i]], method="lambda",  test=T)
+  lambdas[i, "factor"] = iv[i]
+  lambdas[i, "lambda"] = test$lambda
+  lambdas[i, "pvalue"] = test$P
+}
+kable(lambdas)
+```
+
+
+Now, we do our model fitting exercise where we infer which of these variables best predict variation in slope variation across OTUs. This is the same model-averaging approach used in Singhal et al 2017 and first described by Burnham and Anderson 2002.
+
+We took the natural log of two IV variables (ninds, range size) and the dependent variable (slope) based on visual inspection of histograms.
+```{r, echo=F}
+
+## from https://github.com/mrhelmus/phylogeny_manipulation/blob/master/AICc.r
+AICc.phylolm<-function(mod, return.K = FALSE, second.ord = TRUE, nobs = NULL, ...){
+
+    if(identical(nobs, NULL)) {n <- length(mod$residuals)} else {n <- nobs}
+    LL <- logLik(mod)$logLik
+    K <- logLik(mod)$df  #extract correct number of parameters included in model - this includes LM
+    if(second.ord == TRUE) {AICc <- -2*LL+2*K*(n/(n-K-1))}  else{AICc <- -2*LL+2*K}
+    if(return.K == TRUE) AICc[1] <- K #attributes the first element of AICc to K
+    return(AICc)
+  }
+
+fit_models <- function(x, dv, variables, models, tree) {
+	# fit all additive models and store results
+	fits = vector("list", length=length(models))
+	for (i in 1:length(models)) {
+		tmp1 = x[complete.cases(x[, models[[i]]]), ]
+		
+		drop = setdiff(tree$tip.label, rownames(tmp1))
+		tmp_tree = drop.tip(tree, drop)
+		tmp1 = tmp1[tmp_tree$tip.label, ]
+		
+		fmla <- as.formula(paste(dv, " ~ ", paste(models[[i]], collapse= "+")))
+		fit = try(phylolm(fmla, data=tmp1, tmp_tree, model="lambda", lower.bound=0, upper.bound = 10))
+		# cat(i, "\n")
+		if (class(fit) == 'try-error') {
+			fit = lm(fmla, data=tmp1)
+		}
+	
+		fits[[i]] = fit
+		if (i %% 100 == 0) {
+			cat("Model ", i, " of ", length(models), " done.\n", sep="")
+		}
+	}
+
+	aics = sapply(fits, AICc.phylolm)
+	best = min(aics)
+	raw_weights = sapply(aics, weights <- function(x) {exp((best - x)/2)})
+	weights = raw_weights / sum(raw_weights)
+
+	results = vector("list", length=length(variables))
+	names(results) = variables
+	
+	for (i in 1:length(variables)) {
+		var_models = sapply(models, y <- function(x) {variables[i] %in% x})
+	
+		var_fits = fits[var_models]
+		var_coef = sapply(var_fits, y <- function(x) {x$coefficients[variables[i]]})
+		var_pval = sapply(var_fits, y <- function(x) {summary(x)$coefficients[variables[i], 4]})
+		var_wt = weights[var_models]
+		var_raw_wt = raw_weights[var_models]
+		var_rel_raw_wt = var_raw_wt / sum(var_raw_wt)
+	
+		coef = sum(var_coef * var_rel_raw_wt)
+		pval = sum(var_pval * var_rel_raw_wt)
+		rel_imp = sum(var_wt)
+	
+		vals = c(coef, pval, rel_imp)
+		names(vals) = c("coefficient", "pvalue", "rel_importance")
+		results[[i]] = vals
+	}
+
+	full_results = list(fits, aics, weights, results)
+	names(full_results) = c("fits", "AIC", "weight", "results")
+	return(full_results)
+}
+
+# create all possible models
+# this is so many models
+models = list()
+for (i in 1:length(iv)) {
+	l = combn(iv, i, simplify=FALSE)
+	models = append(models, l)
+}
+
+row.names(diff) = diff$OTU
+diff2 = diff[, c(dv, iv)]
+
+logvar = c("range_size", "ninds", "slope")
+for (x in 1:length(logvar)) {
+  diff2[, logvar[x]] = log(diff2[, logvar[x]])
+}
+
+diff2 = diff2[complete.cases(diff2),]
+t4 = drop.tip(t3, setdiff(t3$tip.label, row.names(diff2)))
+diff2 = diff2[t4$tip.label,]
+
+all_fit = fit_models(diff2, dv, iv, models, t4)
+```
+
+# significance of best model
+```{r}
+sigm = phylolm(slope ~ mean_pi + PC1 + lat_midpoint + PC2_range, data=diff2, t4, model="lambda", lower.bound=0, upper.bound = 10)
+
+y1 = pic(diff2$slope, t4)
+x1 = pic(diff2$mean_pi, t4)
+z <- lm(y1 ~ x1 - 1)
+sqrt(summary(z)$r.squared)
+
+y1 = pic(diff2$slope, t4)
+x1 = pic(diff2$PC1, t4)
+z <- lm(y1 ~ x1 - 1)
+sqrt(summary(z)$r.squared)
+
+```
+
+
+
+```{r, echo =F}
+desert = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/divergence/divergence.all_OTUs.biomes.csv", stringsAsFactors = F)
+desert = desert[desert$biome == 'desert', ]
+desert = desert[complete.cases(desert$slope),]
+desert = cbind(desert, diff[desert$OTU, iv])
+
+row.names(desert) = desert$OTU
+desert = desert[, c(dv, iv)]
+
+logvar = c("range_size", "ninds", "slope")
+for (x in 1:length(logvar)) {
+  desert[, logvar[x]] = log(desert[, logvar[x]])
+}
+
+desert = desert[complete.cases(desert),]
+td = drop.tip(t3, setdiff(t3$tip.label, row.names(desert)))
+desert = desert[t4$tip.label,]
+
+all_fit_d = fit_models(desert, dv, iv, models, t4)
+```
+
+
+```{r, echo=F}
+
+pvals <- function(val) {
+	val = round(val, 3)
+	if (val <= 0.05) {
+		return("*")
+	} else {
+		return("")
+	}
+}
+
+coefs <- function(val) {
+	if (val < 0) {
+		return("-")
+	} else {
+		return("+")
+	}
+}
+
+res = all_fit[['results']]
+res = as.data.frame(t(as.data.frame(res)))
+
+pdf(paste(figdir, "S5_modelfitting.pdf", sep=""), height=3, width=6)
+par(mar=c(3.5, 1.1, 1.1, 8.1))
+long = c("n. of inds", "within-pop. pi", "body size", "morph, PC1", "morph, PC2", "range size", "lat. midpoint", "climatic space range (PC1)", "climatic space range (PC2)")
+names(long) = iv
+midpoints <- barplot(res$rel_importance, horiz=T)
+text(0.01, midpoints, labels=long[rownames(res)], adj=c(0,0.5), cex=0.8)
+mtext("relative importance", side=1, line=2)
+mtext(side=4, at=11.5, text="p-val", font=3, las=2, line=2, adj=c(0.5,0.5), cex=0.8)
+mtext(side=4, at=11.5, text="coef", font=3, las=2, line=4.5, adj=c(0.5,0.5), cex=0.8)
+mtext(side=4, at=midpoints, text=sapply(res$pvalue, pvals), las=2, line=2, cex=1.2, adj=c(0.5,0.5))
+mtext(side=4, at=midpoints, text=sapply(res$coefficient, coefs), las=2, line=4.5, cex=1.2, adj=c(0.5,0.5))
+dev.off()
+```
+
+These results suggest that the most important factors explaining variation in IBD slopes are:
+
+- within-pop pi: as expected, as Ne increases, differentiation decreases -- bigger demes experience less drift and are thus differentiate more slowly from adjoining demes
+- shank length: as expected, as an OTU has more substantial legs, differentiation decreases -- a naive explanation: more leggy lizards move more and therefore, higher dispersal leads to reduced differentiation
+
+  - this also might be a body size effect; the correlation between SVL and shank length is ~0.4
+  - bigger animals are also expected to disperse more
+  - though, bigger animals are also expected to have smaller population sizes
+- elevational range: this supports the IBE hypothesis that we see more differentiation with more heterogenetiy (i.e., a positive correlation)
+
+  - I do not trust this result; see below
+
+We can look at these significant results one by one.
+```{r, echo=F}
+diffx = diff[diff$slope > 0,]
+diffx$log_slope = log(diffx$slope)
+diffx$genus2 = "other"
+diffx[diffx$genus == 'Ctenotus', "genus2"] = "Ctenotus"
+diffx[diffx$genus == 'Lerista', "genus2"] = "Lerista"
+a = ggplot(diffx, aes(PC1, log_slope)) + 
+      geom_point(aes(fill = factor(genus2), shape=factor(genus2))) +
+      scale_fill_brewer(palette="Paired", name = "genus") + 
+      scale_shape_manual(values=c(21, 22, 24), name = "genus") +
+      labs(x="limb reduction (morphology PC1)", y=expression(log(beta[IBD])))
+legend = get_legend(a)
+b = ggplot(diffx, aes(mean_pi, log_slope)) + 
+      geom_point(aes(fill = factor(genus2), shape=factor(genus2))) +
+      scale_fill_brewer(palette="Paired", name = "genus") + 
+      scale_shape_manual(values=c(21, 22, 24), name = "genus") +
+      labs(x=expression("within-population " ~ pi), y=expression(log(beta[IBD])))
+
+ab = plot_grid(a + theme(legend.position="none"),
+                b + theme(legend.position="none"),
+                labels = c("A", "B"), align="vh", hjust=-1, ncol=2)
+abl = plot_grid(ab, legend, rel_widths = c(3, .5))
+save_plot(paste(figdir, "5_predictors.pdf", sep=""), abl, ncol = 2, nrow = 1, base_aspect_ratio = 1.4, base_height=3)
+```
+
+
+If we look at these slopes across the phylogeny, we can recapitulate what we saw in the boxplot: there is phylogenetic signal in the pattern of slope. 
+
+```{r, echo=F}
+diff$log_slope = log(diff$slope)
+diff2 = diff[complete.cases(diff$log_slope),]
+diff2 = diff[complete.cases(diff$PC1),]
+t4 = drop.tip(t3, setdiff(t3$tip.label, diff2$OTU))
+t4 = read.tree(text=write.tree(ladderize(t4)))
+pc1 = diff2[match(t4$tip.label, diff2$OTU), "PC1"]
+names(pc1) = t4$tip.label
+map = contMap(t4, pc1, plot=FALSE)
+map = setMap(map,colors=viridis(10), space="Lab")
+
+pdf(paste(figdir, "4_slope_on_phylogeny.pdf", sep=""), width=5, height=4)
+layout(matrix(c(1, 2), nrow=1, byrow=TRUE), widths=c(0.55, 0.45))
+tips = map[[1]]$tip.label
+ctn = findMRCA(map[[1]], tips[grep("Ct", tips)])
+len = findMRCA(map[[1]], tips[grep("Lerista", tips)])
+plot(map, fsize=c(0,0.9), legend = F,
+     lwd=2, ftype="off", outline=F, mar=c(1,0,0,0), 
+     ylim=c(1-0.09*(Ntip(map$tree)-1),Ntip(map$tree)), xpd=NA)
+nodelabels("", ctn, pch=16, col="gray55", frame="none", cex=2.5)
+nodelabels("", len, pch=16, col="gray55", frame="none", cex=2.5)
+nodelabels("C", ctn, pch="", col="black", frame="none", cex=1)
+nodelabels("L", len, pch="", col="black", frame="none", cex=1)
+add.color.bar(20, map$cols, title="limb reduction",
+              lims=map$lims, digits=1, prompt=FALSE, x=1,
+              y=1-0.08*(Ntip(map$tree)-1), lwd=4, fsize=0.8, 
+              subtitle="")
+lastPP <- get("last_plot.phylo", envir = .PlotPhyloEnv)
+ticks = pretty(diff2$log_slope, 3)
+plot(NULL, xlim=range(ticks), ylim=lastPP$y.lim, xlab="", ylab="", axes=F)
+for (i in 1:nrow(diff2)) {
+  yloc = lastPP$yy[match(diff2[i, "OTU"], t4$tip.label)]
+  x1 = min(ticks)
+  x2 = diff2[i, "log_slope"]
+  lines(c(x1, x2), c(yloc, yloc), lwd=0.5, col="gray60")
+}
+points(diff2$log_slope,
+       lastPP$yy[match(diff2$OTU, t4$tip.label)], 
+       pch=16, col="#1f78b4", cex=0.6)
+axis(1, ticks, tck=-0.02, labels=NA, line = -1.8)
+axis(1, ticks, labels=ticks, lwd = 0, line = -2.8, las = 1, cex.axis=0.7)
+mtext(expression(log(beta[IBD])), side=1, line= -0.5, cex=0.8)
+dev.off()
+```
+
+I don't trust the elevation & lat midpoint results because I think they are driven by the biome.
+```{r, echo=F}
+b = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/geographic_ranges/otu_biomes.csv", stringsAsFactors = F)
+diffb = diff
+diffb$biome1 = b[match(diffb$OTU, b$OTU), "biome"]
+
+biomes = table(diffb$biome1)
+biomes = names(biomes[ biomes >= 3])
+diffb$biome = diffb$biome1
+diffb[!diffb$biome %in% biomes, "biome"] = "other"
+diffb$log_slope = log(diffb$slope)
+
+a = ggplot(diffb, aes(lat_midpoint, log_slope)) +
+  geom_point(pch=21, size=2, aes(fill = factor(biome))) + 
+  scale_fill_brewer(palette="Paired", name = "biome") + 
+  labs(x="lat. midpoint", y=expression(log(beta[IBD])))
+b = ggplot(diffb, aes(PC2_range, log_slope)) +
+  geom_point(pch=21, size=2, aes(fill = factor(biome))) + 
+  scale_fill_brewer(palette="Paired", name = "biome") + 
+  labs(x="climatic space, PC2", y=expression(log(beta[IBD])))
+c =  ggplot(diffb, aes(biome, lat_midpoint,  fill=factor(biome))) +
+  geom_boxplot() + coord_flip() +
+  scale_fill_brewer(palette="Paired") +
+  labs(y="lat. midpoint")
+d =  ggplot(diffb, aes(biome, PC2_range,  fill=factor(biome))) +
+  geom_boxplot() + coord_flip() +
+  scale_fill_brewer(palette="Paired") +
+  labs(y="climatic space, PC2")
+abc = plot_grid(a + theme(legend.position="none"), b + theme(legend.position="none"),
+                c + theme(legend.position="none"), d + theme(legend.position="none"),
+                labels = c("A", "B", "C", "D"), hjust=-1, ncol=2)
+save_plot(paste(figdir, "S6_biomes.pdf", sep=""), abc, ncol = 2, nrow = 2, base_aspect_ratio = 1.3, base_height=4.5)
+```
+
+When you restrict the analysis to the desert individuals, this result disappears:
+
+  - PC2 climatic range p-value `r all_fit_d$results$PC2_range['pvalue']` 
+  - lat midpoint p-value `r all_fit_d$results$lat_midpoint['pvalue']`
+
+```{r, echo =F}
+diff$log_range = log(diff$range_size)
+cor1 = cor.test(diff$PC1, diff$log_range, method="spearman")
+cor2 = cor.test(diff$PC1, diff$mean_pi, method="spearman")
+cor3 = cor.test(diff$log_range, diff$mean_pi, method="spearman")
+
+label1 <- substitute(paste(rho, " = ", estimate, ", P = ", pvalue, sep=""),
+                    list(estimate = signif(cor1$estimate, 2), pvalue = signif(cor1$p.value, 1)))
+label2 <- substitute(paste(rho, " = ", estimate, ", P = ", pvalue, sep=""),
+                     list(estimate = signif(cor2$estimate, 2), pvalue = signif(cor2$p.value, 1)))
+label3 <- substitute(paste(rho, " = ", estimate, ", P = ", pvalue, sep=""),
+                     list(estimate = signif(cor3$estimate, 2), pvalue = signif(cor3$p.value, 1)))
+
+a = ggplot(diff, aes(PC1, log_range)) + geom_point(pch=21, fill="#1f78b4") + labs(x = "limb reduction (morph PC1)", y=expression("log(range size, km"^2 ~ ")"), title=label1)
+b = ggplot(diff, aes(PC1, mean_pi)) + geom_point(pch=21, fill="#1f78b4") + labs(x = "limb reduction (morph PC1)", y=expression("within-population " ~ pi), title=label2)
+c = ggplot(diff, aes(log_range, mean_pi)) + geom_point(pch=21, fill="#1f78b4") + labs(y = expression("within-population " ~ pi), x=expression("log(range size, km"^2 ~ ")"), title=label3)
+
+abc = plot_grid(a, b, c, labels = c("A", "B", "C"), align="vh", hjust=-1, ncol=3)
+save_plot(paste(figdir, "S7_predictor_interactions.pdf", sep=""), abc, ncol = 3, nrow = 1, base_aspect_ratio = 1.4, base_height=3)
+```
+
+
+### Correlations between Slopes inferred using different metrics
+
+This analysis is because I think it will be of interest to people in the community. We do not see strong correlations here, though there are correlations. Note (again) that there is no theoretical foundation for looking at mtDNA and nDNA dxy differentiation across space.
+```{r, echo=F, fig.width=10, fig.height=3.5}
+slopes = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/divergence/divergence.all_OTUs.csv", stringsAsFactors=F)
+s1 = slopes[slopes$genetic_type == 'nuc_dxy' & slopes$distance_type == "geo_dist", ]
+s2 = slopes[slopes$genetic_type == 'fst' & slopes$distance_type == "geo_dist", ]
+s3 = slopes[slopes$genetic_type == 'mt_dxy' & slopes$distance_type == "geo_dist", ]
+
+s1 = s1[,c('OTU', 'slope')]
+names(s1) = c("OTU", "nuc_slope")
+s1$fst_slope = s2[match(s1$OTU, s2$OTU), "slope"]
+s1$mt_slope = s3[match(s1$OTU, s3$OTU), "slope"]
+
+cor1 = cor.test(s1$fst_slope, s1$nuc_slope)
+cor2 = cor.test(s1$fst_slope, s1$mt_slope)
+cor3 = cor.test(s1$mt_slope, s1$nuc_slope)
+
+label1 <- substitute(paste(rho, " = ", estimate, ", P = ", pvalue, sep=""),
+                    list(estimate = signif(cor1$estimate, 2), pvalue = signif(cor1$p.value, 1)))
+label2 <- substitute(paste(rho, " = ", estimate, ", P = ", pvalue, sep=""),
+                     list(estimate = signif(cor2$estimate, 2), pvalue = signif(cor2$p.value, 1)))
+label3 <- substitute(paste(rho, " = ", estimate, ", P = ", pvalue, sep=""),
+                     list(estimate = signif(cor3$estimate, 2), pvalue = signif(cor3$p.value, 1)))
+
+a = ggplot(s1, aes(fst_slope, nuc_slope)) + geom_point() + labs(x = expression("slope from F"[ST]), y=expression("slope from nDNA d"[xy]), title=label1)
+b = ggplot(s1, aes(fst_slope, mt_slope)) + geom_point() + labs(x = expression("slope from F"[ST]), y=expression("slope from mtDNA d"[xy]), title=label2)
+c = ggplot(s1, aes(mt_slope, nuc_slope)) + geom_point() + labs(y = expression("slope from nDNA d"[xy]), x=expression("slope from mtDNA d"[xy]), title=label3)
+
+abc = plot_grid(a, b, c, labels = c("A", "B", "C"), align="vh", hjust=-1, ncol=3)
+save_plot(paste(figdir, "S3_slope_correlations.pdf", sep=""), abc, ncol = 3, nrow = 1, base_aspect_ratio = 1.4, base_height=3)
+```
+
+### Other ways of measuring genetic differentiation
+```{r, echo=T}
+cl = read.csv("~/macroevolution/eco_IBD_oz/data/pop_gen_clustering/fastStructure/chooseK_allClusters.csv", stringsAsFactors = F)
+diff$clno = cl[match(diff$cluster, cl$cluster), "model_complexity"]
+
+diffcl = diff[complete.cases(diff$clno),]
+diffcl$log_slope = log(diffcl$slope)
+diffcl = diffcl[complete.cases(diffcl$log_slope),]
+
+a = ggplot(diffcl, aes(log_slope, clno)) + 
+  geom_smooth(method = "lm", se = FALSE, colour="gray") +
+  geom_point(colour="black", pch=21, bg="gray") + 
+  labs(y="number of clusters", x=expression(log(beta[IBD]))) 
+a
+
+keep = intersect(diffcl$OTU, t3$tip.label)
+tcl = drop.tip(t3, setdiff(t3$tip.label, keep))
+
+m = phylolm("log_slope ~ clno", data = diffcl, phy = tcl, model="lambda")
+
+save_plot(paste(figdir, "3_differentiation_clustering.pdf", sep=""), a, ncol = 1, nrow = 1, base_aspect_ratio = 1.3, base_height= 3)
+
+rownames(diffcl) = diffcl$OTU
+diffcl = diffcl[tcl$tip.label, ]
+pglsModel3 <- gls(clno ~ log_slope, correlation = corBrownian(phy = tcl), data = diffcl, method = "ML")
+```
+
+
+## Genetic Differentiation and Speciation
+
+### Variation in speciation results
+One of the classic results in this work comes from Dan's work (Rabosky et al 2007, Rabosky et al 2014) showing that Ctenotus & Lerista have much higher rates of speciation than the rest of the clade. I am repeating these results here using our tree which includes putative new OTUs. For now, just using the diversification rate (DR) statistic used by Jetz et al 2012.
+```{r, echo=F}
+source("~/scripts/gene_flow/jetz_div_rates.R")
+rates = jetzDivRates(t2)
+```
+
+```{r, echo=F}
+rateslog = log(rates)
+jenks = classIntervals(rateslog, 64, style="jenks")
+
+t2 = ladderize(t2)
+colors = viridis(64)
+x_cols = colors[findCols(jenks)]
+names(x_cols) = names(rates)
+edgecols = rep("gray", nrow(t2$edge))
+tip.order = t2$tip.label[t2$edge[,2][t2$edge[,2] <= length(t2$tip.label)]]
+edge.tip.labels = tip.order[t2$edge[,2]]
+
+cols = x_cols[match(edge.tip.labels, names(x_cols))]
+cols[is.na(cols)] = "lightgray"
+widths = rep(2, length(cols))
+widths[which(cols == "lightgray")] = 0.5
+
+
+figs <- matrix(c(0, 0.8, 0, 1, 0.90, 0.95, 0.33, 0.66), byrow = TRUE, nrow = 2, ncol = 4)
+
+par(fig = figs[1, ], new = F, mar = c(0, 0, 0, 0))
+plot(t2, type="fan", edge.color=cols, edge.width=widths, show.tip.label=F)
+
+legdf = data.frame(jenks$brks[2:length(jenks$brks)], colors)
+rownames(legdf) = NULL
+names(legdf) = c("log_value", "color")
+legdf$value = exp(legdf$log_value)
+
+par(fig = figs[2, ], new = T, mar=c(0, 0, 0, 0))
+ticknames = c(0.03, 0.1, 0.2)
+ticks = log(ticknames)
+color.bar(as.character(legdf$color), min=min(legdf$log_value), max=max(legdf$log_value), ticks, ticknames, title="diff. rate")
+```
+
+As shown earlier, we still see that Ctenotus & Lerista have higher rates of speciation than the rest of the clade.
+```{r, echo=F}
+rates2 = data.frame(rates)
+rates2$genus = gsub("_\\S+", "", rownames(rates2))
+gen = table(rates2$genus)
+rates3 = rates2[rates2$genus %in% names(gen[gen >= 3]),]
+ggplot(rates3, aes(genus, rates)) + geom_boxplot() + coord_flip()
+```
+
+Here, we show the phylogeny with variance in speciation rates again, showing only those tips that we sampled.
+```{r, echo=F}
+edge.tip.labels = t3$tip.label[t3$edge[,2]]
+cols = x_cols[match(edge.tip.labels, names(x_cols))]
+cols[is.na(cols)] = "lightgray"
+widths = rep(2, length(cols))
+widths[which(cols == "lightgray")] = 0.5
+plot(t3, edge.color=cols, type="fan", edge.width=widths, show.tip.label=F)
+```
+
+BAMM results showed strong support for 1 shift.
+```{r, echo=F}
+types1 = c("otu", "species")
+types2 = c("timevarying")
+res = vector('list', length(types1) * length(types2))
+for (i in 1:length(types1)) {
+    file = paste("~/Dropbox/Sphenomorphine_Gene_Flow/data/speciation_rates/bamm_runs/run1/", types1[i], "_bamm_", types2[1], "/bamm_mcmc.txt", sep="")
+    mcmcd = read.csv(file, stringsAsFactors = F)
+    burnstart <- floor(0.6 * nrow(mcmcd))
+    postburn <- mcmcd[burnstart:nrow(mcmcd), ]
+    n = i
+    names(res)[n] = paste(types1[i], types2[1], sep=", ")
+    res[[n]] = postburn
+}
+graphs = vector('list', length(res))
+names = c("OTU, time-varying", "species, time-varying")
+for (i in 1:length(graphs)) {
+  graphs[[i]] = ggplot(res[[i]], aes(N_shifts)) + 
+    geom_histogram() + labs(x="number of shifts", title=names[i]) + xlim(-1, 6)
+}
+```
+
+
+Let's compare BAMM and Jetz rates.
+```{r, echo=F}
+source("~/scripts/gene_flow/freckleton_2008.R")
+source("~/scripts/gene_flow/jetz_div_rates.R")
+tree = read.tree("~/Dropbox/Sphenomorphine_Gene_Flow/data/phylogeny/beast_ucln_31July17/otu.tre")
+tree = read.tree(text = write.tree(ladderize(tree)))
+edata <- getEventData(tree, nsamples=2000, eventdata = "~/Dropbox/Sphenomorphine_Gene_Flow/data/speciation_rates/bamm_runs/run1/otu_bamm_timevarying/bamm_event.txt", burnin=0.5)
+sub <- subtreeBAMM(edata, tips = diff$OTU)
+BAMM_rates <- getTipRates(edata)$lambda.avg
+jetz_rates = jetzDivRates(tree)
+freck_rates = speciationRateNodeDensity(tree)
+rates = merge(BAMM_rates, jetz_rates, by="row.names", all=T)
+rates = merge(rates, freck_rates, by.x="Row.names", by.y="row.names", all=T)
+names(rates) = c("OTU", "BAMM_rates", "jetz_rates", "freck_rates")
+ggplot(rates, aes(BAMM_rates, jetz_rates)) + geom_point()
+
+treeS = read.tree("~/Dropbox/Sphenomorphine_Gene_Flow/data/phylogeny/skinktree_216.tre")
+treeS = read.tree(text = write.tree(ladderize(treeS)))
+edataS <- getEventData(treeS, nsamples=2000, eventdata = "~/Dropbox/Sphenomorphine_Gene_Flow/data/speciation_rates/bamm_runs/run1/species_bamm_timevarying/bamm_event.txt", burnin=0.5)
+BAMM_ratesS <- getTipRates(edataS)$lambda.avg
+jetz_ratesS = jetzDivRates(treeS)
+ratesS = merge(BAMM_ratesS, jetz_ratesS, by="row.names", all=T)
+names(ratesS) = c("species", "BAMM_rates", "jetz_rates")
+ggplot(rates, aes(BAMM_rates, jetz_rates)) + geom_point()
+```
+
+The two measures are fairly correlated: `r cor.test(rates$BAMM_rates, rates$jetz_rates)$estimate`.
+
+```{r, echo=F}
+rownames(rates) = rates$OTU
+pdf(paste(figdir, "6_speciation_rates.pdf", sep=""), width=5, height=4)
+layout(matrix(c(1, 2, 3), nrow=1, byrow=TRUE), widths=c(2, 1, 1))
+par(mar=c(4.1,1.1,1.1,0))
+# plot.phylo(tree, show.tip.label=F, cex=0.6)
+x = plot.bammdata(sub, tau = 0.001, breaksmethod='quantile', pal="RdYlBu", legend=F)
+shiftnodes = getShiftNodesFromIndex(sub, index=100)
+nodelabels(node = shiftnodes, pch=16, col=alpha("gray60", 0.5), cex=3)
+xx = addBAMMlegend(x, location=c(0, 10, 0, 2), direction="horizontal", nTicks=1)
+text(xx$tickLocs[2], -2, "speciation rate", adj=c(0.5, 0.5))
+lastPP <- get("last_plot.phylo", envir = .PlotPhyloEnv)
+plot_rates <- function(type, label) {
+  par(mar=c(4.1,0,1.1,2.1))
+  rownames(rates) = rates$OTU
+  rates2 = rates[sub$tip.label, ]
+  ticks = pretty(c(0, rates2[, type]), 3)
+  plot(NULL, xlim=range(ticks), ylim=c(1, nrow(rates2))-0.5, xlab="", ylab="", axes=F)
+  for (i in 1:nrow(rates2)) {
+    yloc = lastPP$yy[match(rownames(rates2)[i], sub$tip.label)]
+    x1 = min(ticks)
+    x2 = rates2[i, type]
+    lines(c(x1, x2), c(yloc, yloc), lwd=0.5, col="gray60")
+  }
+  points(rates2[sub$tip.label, type],
+         lastPP$yy[1:length(sub$tip.label)], pch=16, 
+         col="#1f78b4", cex=0.5)
+  axis(1, ticks, tck=-0.02, labels=NA)
+  axis(1, ticks, labels=ticks, lwd = 0, line = -0.6, las = 1)
+  mtext(label, side=1, line=1.7, cex=0.7)
+}
+plot_rates("BAMM_rates", expression(lambda[BAMM]))
+plot_rates("jetz_rates", expression(lambda[DR]))
+dev.off()
+```
+
+### Connection between genetic differentiation and speciation?
+
+Looking at this at the high level
+```{r, echo=F}
+rates$diff = diff[match(rates$OTU, diff$OTU), "slope"]
+rates2 = rates[complete.cases(rates$diff), ]
+rates2$genus = gsub("_\\S+", "", rates2$OTU)
+rates2$genus2 = rep("other", nrow(rates2))
+rates2[rates2$genus == 'Ctenotus', "genus2"] = "Ctenotus"
+rates2[rates2$genus == 'Lerista', "genus2"] = "Lerista"
+
+sdiff = diff
+sdiff$species = gsub('_\\d$', '', tolower(sdiff$OTU))
+sdiff = aggregate(sdiff$slope, by=list(sdiff$species), mean, na.rm=T)
+names(sdiff) = c("species", "slope")
+
+ratesS$diff = sdiff[match(ratesS$species, sdiff$species), "slope"]
+ratesS2 = ratesS[complete.cases(ratesS$diff), ]
+ratesS2$genus = gsub("_\\S+", "", ratesS2$species)
+ratesS2$genus2 = rep("other", nrow(ratesS2))
+ratesS2[ratesS2$genus == 'ctenotus', "genus2"] = "Ctenotus"
+ratesS2[ratesS2$genus == 'lerista', "genus2"] = "Lerista"
+
+a = ggplot(rates2, aes(genus2, log(diff), fill=factor(genus2))) + 
+  geom_boxplot() +
+  scale_fill_brewer(palette="Paired", name = "genus2") + 
+  scale_x_discrete("genus", labels=expression(italic(Ctenotus), italic(Lerista), "other")) +
+  labs(x="genus", y=expression(beta[IBD])) + theme(axis.title.x = element_blank())
+b = ggplot(rates2, aes(genus2, BAMM_rates, fill=factor(genus2))) + 
+  geom_boxplot() + ylim(0, 0.08) + 
+  scale_fill_brewer(palette="Paired", name = "genus2") + 
+   scale_x_discrete("genus", labels=expression(italic(Ctenotus), italic(Lerista), "other")) +
+  labs(x="genus", y=expression(lambda[BAMM]))  + theme(axis.title.x = element_blank()) 
+c = ggplot(rates2, aes(genus2, jetz_rates, fill=factor(genus2))) + 
+  geom_boxplot() +  ylim(0, 0.2) + 
+  scale_fill_brewer(palette="Paired", name = "genus2") + 
+   scale_x_discrete("genus", labels=expression(italic(Ctenotus), italic(Lerista), "other")) +
+  labs(x="genus", y=expression(lambda[DR]))  + theme(axis.title.x = element_blank())
+
+d = ggplot(ratesS2, aes(genus2, log(diff), fill=factor(genus2))) + 
+  geom_boxplot() +
+  scale_fill_brewer(palette="Paired", name = "genus2") + 
+  scale_x_discrete("genus", labels=expression(italic(Ctenotus), italic(Lerista), "other")) +
+  labs(x="genus", y=expression(beta[IBD])) + theme(axis.title.x = element_blank())
+e = ggplot(ratesS2, aes(genus2, BAMM_rates, fill=factor(genus2))) + 
+  geom_boxplot() + ylim(0, 0.08) + 
+  scale_fill_brewer(palette="Paired", name = "genus2") + 
+   scale_x_discrete("genus", labels=expression(italic(Ctenotus), italic(Lerista), "other")) +
+  labs(x="genus", y=expression(lambda[BAMM]))  + theme(axis.title.x = element_blank())
+f = ggplot(ratesS2, aes(genus2, jetz_rates, fill=factor(genus2))) + 
+  geom_boxplot() +  ylim(0, 0.2) + 
+  scale_fill_brewer(palette="Paired", name = "genus2") + 
+   scale_x_discrete("genus", labels=expression(italic(Ctenotus), italic(Lerista), "other")) +
+  labs(x="genus", y=expression(lambda[DR]))  + theme(axis.title.x = element_blank())
+
+abc = plot_grid(a + theme(legend.position="none"), 
+                b + theme(legend.position="none"), 
+                c + theme(legend.position="none"),
+                labels = c("A", "B", "C"), align="vh", hjust=0, ncol=1, nrow=3)
+save_plot(paste(figdir, "6_boxplot_rates.pdf", sep=""), abc, ncol = 1, nrow = 3, base_aspect_ratio = 1.4, base_height=2.5)
+```
+
+```{r, echo = F}
+abc = plot_grid(a + theme(legend.position="none"), 
+                d + theme(legend.position="none"), 
+                graphs[[1]],
+                graphs[[2]],
+                b + theme(legend.position="none"),
+                e + theme(legend.position="none"), 
+                c + theme(legend.position="none"), 
+                f + theme(legend.position="none"),
+                labels = c("A", "E", "B", "F", "C", "G", "D", "H"), align="vh", hjust=0, ncol=2, nrow=4)
+save_plot(paste("/Users/sonal/Desktop/", "S9_boxplot_rates.pdf", sep=""), abc, ncol = 2, nrow = 4, base_aspect_ratio = 1.4, base_height=3)
+```
+
+
+Finally, we test for if variation in genetic differentiation can explain variation in speciation rates, using a PGLS.
+```{r, echo=F}
+diff$jetz_rates = rates[match(diff$OTU, rates$OTU), "jetz_rates"]
+diff$freck_rates = rates[match(diff$OTU, rates$OTU), "freck_rates"]
+diff$log_jetz_rates = log(diff$jetz_rates)
+diff$log_freck_rates = log(diff$freck_rates)
+diff$log_slope = log(diff$slope)
+rownames(diff) = diff$OTU
+diff2 = diff[complete.cases(diff$log_slope),]
+diff2 = diff2[complete.cases(diff2$jetz_rates),]
+tdiff = drop.tip(t3, setdiff(t3$tip.label, rownames(diff2)))
+
+gls_model1a = gls(jetz_rates ~ slope, correlation=corBrownian(phy=tdiff), data=diff2, method="ML")
+gls_model1b = gls(freck_rates ~ slope, correlation=corBrownian(phy=tdiff), data=diff2, method="ML")
+gls_model2a = gls(jetz_rates ~ log_slope, correlation=corBrownian(phy=tdiff), data=diff2, method="ML")
+gls_model2b = gls(freck_rates ~ log_slope, correlation=corBrownian(phy=tdiff), data=diff2, method="ML")
+gls_model3a = gls(log_jetz_rates ~ log_slope, correlation=corBrownian(phy=tdiff), data=diff2, method="ML")
+gls_model3b = gls(log_freck_rates ~ log_slope, correlation=corBrownian(phy=tdiff), data=diff2, method="ML")
+model1 = lm(diff2$jetz_rates ~ diff2$log_slope)
+model2 = lm(diff2$freck_rates ~ diff2$log_slope)
+
+diff2$genus2 = "other"
+diff2[diff2$genus == 'Ctenotus', "genus2"] = "Ctenotus"
+diff2[diff2$genus == 'Lerista', "genus2"] = "Lerista"
+
+a = ggplot(diff2, aes(log_slope, jetz_rates)) + 
+      geom_point(aes(fill = factor(genus2), shape=factor(genus2))) +
+      coord_trans(y = "log") +
+      scale_fill_brewer(palette="Paired", name = "genus") + 
+      scale_shape_manual(values=c(21, 22, 24), name = "genus") +
+      labs(y=expression(lambda[DR]), x=expression(log(beta[IBD])))
+
+
+save_plot(paste(figdir, "8_speciation_diff_rates.pdf", sep=""), a, ncol = 1, nrow = 1, base_aspect_ratio = 1.3, base_height=4)
+
+y1 = pic(diff2$log_jetz_rates, tdiff)
+x1 = pic(diff2$log_slope, tdiff)
+z <- lm(y1 ~ x1 - 1)
+sqrt(summary(z)$r.squared)
+```
+
+```{r, echo=F}
+diff3 = diff2
+diff3$clno = diffcl[rownames(diff2), "clno"]
+diff3 = diff3[complete.cases(diff3$clno), ]
+
+clgls1 = gls(jetz_rates ~ clno, correlation=corBrownian(phy=tcl), data=diff3, method="ML")
+clgls2 = gls(freck_rates ~ clno, correlation=corBrownian(phy=tcl), data=diff3, method="ML")
+```
+
+```{r, echo=F}
+diff$rates = rates[diff$OTU]
+diff$log_rates = log(diff$rates)
+diff$log_shank = log(diff$shank)
+rownames(diff) = diff$OTU
+diff2 = diff[complete.cases(diff$log_shank),]
+diff2 = diff2[diff2$shank > 0,]
+tdiff = drop.tip(t3, setdiff(t3$tip.label, rownames(diff2)))
+gls_model1 = gls(rates ~ shank, correlation=corBrownian(phy=tdiff), data=diff2, method="ML")
+gls_model2 = gls(rates ~ log_shank, correlation=corBrownian(phy=tdiff), data=diff2, method="ML")
+gls_model3 = gls(log_rates ~ log_shank, correlation=corBrownian(phy=tdiff), data=diff2, method="ML")
+```
+
+
+We tested a model in which we took the log of the differentiation slope and one in which we did not, and in neither, does the differentiation slope significantly predict the DR speciation rate. For the untransformed data, the p-value is `r summary(gls_model1)$tTable[2, 4]` and for the transformed data, it is `r summary(gls_model2)$tTable[2, 4]`.
+
+Our data provide no evidence that variation in rates of genetic differentiation explain variation in speciation rates.
+
+# Power
+
+```{r, echo = F}
+power = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/power_analysis/", stringsAsFactors = F)
+power0 = power[power$cor > 0, ]
+a = ggplot(power0, aes(cor, power)) + geom_point() + labs(x="simulated correlation", y="power") + geom_hline(yintercept = power[power$cor == 0, "power"], colour="red", linetype=2)
+
+power2 = read.csv("~/Dropbox/Sphenomorphine_Gene_Flow/data/power_analysis/ES-SIM_power.csv", stringsAsFactors = F)
+
+power2 = power2[power2$cor > 0, ]
+b = ggplot(power2, aes(cor, power)) + geom_point() + labs(x="simulated correlation", y="power") + geom_hline(yintercept = power[power$cor == 0, "power"], colour="red", linetype=2)
+
+ab = plot_grid(a, b, labels = c("A", "B"), align="vh", hjust=0, ncol=2, nrow=1)
+save_plot(paste(figdir, "S10_power.pdf", sep=""), ab, ncol = 2, nrow = 1, base_aspect_ratio = 1.4, base_height=2.5)
+```
+
